@@ -1,21 +1,34 @@
 #pragma once
 #include <limits>
+#include <vector>
+
+using std::vector;
 
 struct Pixel { unsigned char r, g, b, a; };
+static_assert(sizeof(Pixel) == 4, "Pixel must be 4 bytes");
 
 struct Vec3 { float x, y, z; };
 
 
 struct Rotation3matrix { Vec3 x, y, z; }; //x, y, z
 
-
+struct locPixelv{ Pixel color; Vec3 cordinates; Vec3 normal; float t; };
 
 struct Ray { Vec3 origin, direction; };
 
 class ClosestP{ public:
-float nearT = std::numeric_limits<float>::max();
-Pixel color = {0, 0, 0};
+locPixelv colCord = {{0, 0, 0, 0}, {0, 0, 0}, {0, 0, 0}, std::numeric_limits<float>::max()};
+bool hit = 0;
+
+void closestH(locPixelv newColCord);
 };
+
+//for later optimization
+//struct RelevantObjects{vector<Objects>;};
+
+//struct RelevantLightSources{vector<LightSource>;};
+
+
 
 
 float dotProduct3v(const Vec3 &a, const Vec3 &b);
@@ -32,6 +45,7 @@ Vec3 normalize3v(Vec3 vector);
 
 float degreesToRadians(float degrees);
 
+Vec3 rodriguesRotation(Vec3 u, Vec3 v);
 
 
 
@@ -59,5 +73,30 @@ Vec3 localToGlobal(float xo, float yo, float zo);
 };
 
 
+class LightSource{public:
+    Vec3 cordinates;
+    unsigned char brightness;
+    Pixel color;
+
+LightSource(Vec3 cordinates, unsigned char brightness, Pixel color);
+
+};
 
 
+
+
+class Sphere{ public:
+Vec3 location;
+float radius; 
+Pixel color;
+
+Sphere(Vec3 location, float radius, Pixel color);
+
+locPixelv hitRR(Ray ray);
+};
+
+
+
+
+
+Pixel postLighting(const LightSource &light, const locPixelv &point );
