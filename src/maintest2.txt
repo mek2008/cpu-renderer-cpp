@@ -1,0 +1,213 @@
+// ============================================================================
+//  ERROR-TESTING SCENE  -  4 cameras, 4 images
+//
+//  What each thing is there to catch:
+//   * checker floor ........ flat AABBs, shadow acne, glossy reflection, image orientation
+//   * 3 coloured lights .... R/G/B shadows overlap -> cyan/magenta/yellow shadows, white where all lit
+//   * 1 white raking light . very low angle: shadow terminator on spheres, long pillar shadow
+//   * diffuse sphere ....... faceted "fake circle": terminator acne, silhouette, flat normals
+//   * mirror sphere ........ reflection direction, curved reflections, reflection of reflections
+//   * glass sphere ......... front + back faces, transparency depth, see-through shadow
+//   * hovering disc ........ triangle fan, round shadow shape (should be an ellipse, no gaps)
+//   * 2 stacked glass panes  known bug: shadow only counts the first transparent hit
+//   * thin pillar .......... long shadow, thin AABB
+//   * sliver triangle ...... tiny-AABB / precision test (thin magenta line)
+//   * degenerate triangles . must not crash, hang or make NaN (you should NOT see them)
+//   * axis gizmo ........... white = origin, red = +x, green = +y, blue = +z (orientation check)
+//   * 2 facing mirror walls  infinite regress, tests the reflection depth cap + speed
+//   * glossy gold box ...... rough reflection (reflectionSpread + multi-sample), cam 4 only
+// ============================================================================
+#include <iostream>
+#include <cmath>
+#include <chrono>
+
+#include "camera.hpp"
+#include "BVH.hpp"
+#include "objects.hpp"
+#include "settings.hpp"
+
+using std::cout;
+
+// ---------- scene-building helpers ----------
+static const int MAX_TRIS = 4096;
+static Triangle *tris = nullptr;
+static int triCount = 0;
+static float curSpread = 0.0f;   // reflectionSpread used by every triangle added after it is set
+
+static void addTri(Vec3 a, Vec3 b, Vec3 c, Pixel color, float reflectivity = 0.0f){
+    if(triCount >= MAX_TRIS){ cout << "MAX_TRIS reached!\n"; return; }
+    Triangle &t = tris[triCount++];
+    t.Triangleinit(a, b, c);
+    t.data->color = color;
+    t.data->reflectivity = reflectivity;
+    t.data->reflectionSpread = curSpread;
+    t.data->density = 1.0f;
+    t.data->apsnormal = t.data->normal;
+    t.data->bpsnormal = t.data->normal;
+    t.data->cpsnormal = t.data->normal;
+}
+
+static void addQuad(Vec3 a, Vec3 b, Vec3 c, Vec3 d, Pixel color, float reflectivity = 0.0f){
+    addTri(a, b, c, color, reflectivity);
+    addTri(a, c, d, color, reflectivity);
+}
+
+static void addBox(Vec3 c, Vec3 h, float yaw, Pixel color, float reflectivity = 0.0f){
+    float cs = cosf(yaw), sn = sinf(yaw);
+    Vec3 p[8];
+    for(int i = 0; i < 8; i++){
+        float x = (i & 1) ? h.x : -h.x;
+        float y = (i & 2) ? h.y : -h.y;
+        float z = (i & 4) ? h.z : -h.z;
+        p[i] = {c.x + x * cs + z * sn, c.y + y, c.z - x * sn + z * cs};
+    }
+    addQuad(p[0], p[1], p[3], p[2], color, reflectivity);
+    addQuad(p[4], p[5], p[7], p[6], color, reflectivity);
+    addQuad(p[0], p[2], p[6], p[4], color, reflectivity);
+    addQuad(p[1], p[3], p[7], p[5], color, reflectivity);
+    addQuad(p[0], p[1], p[5], p[4], color, reflectivity);
+    addQuad(p[2], p[3], p[7], p[6], color, reflectivity);
+}
+
+// UV sphere: the "fake circle". More segments = rounder.
+static void addSphere(Vec3 c, float r, int segs, int rings, Pixel color, float reflectivity = 0.0f){
+    auto pt = [&](int ring, int seg){
+        float phi = PI * static_cast<float>(ring) / static_cast<float>(rings);
+        float th  = 2.0f * PI * static_cast<float>(seg % segs) / static_cast<float>(segs);
+        return Vec3{c.x + r * sinf(phi) * cosf(th), c.y + r * cosf(phi), c.z + r * sinf(phi) * sinf(th)};
+    };
+    for(int ring = 0; ring < rings; ring++){
+        for(int seg = 0; seg < segs; seg++){
+            Vec3 a = pt(ring, seg),     b = pt(ring, seg + 1);
+            Vec3 d = pt(ring + 1, seg), e = pt(ring + 1, seg + 1);
+            if(ring == 0)              addTri(a, e, d, color, reflectivity);   // top cap
+            else if(ring == rings - 1) addTri(a, b, d, color, reflectivity);   // bottom cap
+            else                       addQuad(a, b, e, d, color, reflectivity);
+        }
+    }
+}
+
+// flat horizontal disc (triangle fan)
+static void addDisc(Vec3 c, float r, int segs, Pixel color, float reflectivity = 0.0f){
+    for(int s = 0; s < segs; s++){
+        float t0 = 2.0f * PI * static_cast<float>(s) / static_cast<float>(segs);
+        float t1 = 2.0f * PI * static_cast<float>(s + 1) / static_cast<float>(segs);
+        addTri(c, {c.x + r * cosf(t0), c.y, c.z + r * sinf(t0)},
+                  {c.x + r * cosf(t1), c.y, c.z + r * sinf(t1)}, color, reflectivity);
+    }
+}
+
+static void buildBVH(BVHNode *node){
+    if(node->triangleCount < BVH_LEAF_MIN_TRIANGLES * 2) return;
+    BVHsplit(node);
+    buildBVH(node->subNodes[0]);
+    buildBVH(node->subNodes[1]);
+}
+
+// ---------- camera jobs ----------
+struct CamJob{
+    const char *file;
+    Vec3 pos;
+    float focal, yaw, pitch;
+    int antialiasing = 2;
+    ToneMapping mode;
+    int reflectionDepth, reflectionSamples;
+};
+
+int main(){
+    const int W = 800, H = 450;   // raise for pretty pictures, lower for fast tests
+
+    cout << "building scene\n";
+    tris = new Triangle[MAX_TRIS];
+
+    // ----- floor (y = 0) -----
+    const float tile = 2.5f;
+    for(int ix = 0; ix < 12; ix++){
+        for(int iz = 0; iz < 12; iz++){
+            float x0 = -15.0f + static_cast<float>(ix) * tile;
+            float z0 = -15.0f + static_cast<float>(iz) * tile;
+            bool dark = ((ix + iz) % 2) == 0;
+            Pixel col = dark ? Pixel{80, 82, 100, 255} : Pixel{215, 215, 220, 255};
+            addQuad({x0, 0.0f, z0}, {x0 + tile, 0.0f, z0}, {x0 + tile, 0.0f, z0 + tile}, {x0, 0.0f, z0 + tile}, col, 0.1f);
+        }
+    }
+
+    // ----- walls: matte back wall, two facing mirrors -----
+    addQuad({-15.0f, 0.0f, 15.0f}, {15.0f, 0.0f, 15.0f}, {15.0f, 12.0f, 15.0f}, {-15.0f, 12.0f, 15.0f}, Pixel{150, 150, 170, 255});
+    addQuad({-15.0f, 0.0f, -15.0f}, {-15.0f, 0.0f, 15.0f}, {-15.0f, 10.0f, 15.0f}, {-15.0f, 10.0f, -15.0f}, Pixel{235, 240, 255, 255}, 0.9f);
+    addQuad({15.0f, 0.0f, -15.0f}, {15.0f, 0.0f, 15.0f}, {15.0f, 10.0f, 15.0f}, {15.0f, 10.0f, -15.0f}, Pixel{235, 240, 255, 255}, 0.9f);
+
+    // ----- spheres (the fake circles) -----
+    addSphere({-4.0f, 1.5f, 3.0f}, 1.5f, 24, 12, Pixel{230, 230, 230, 255});                 // diffuse
+    addSphere({ 3.5f, 1.5f, 4.0f}, 1.5f, 24, 12, Pixel{240, 240, 255, 255}, 0.9f);           // mirror
+    addSphere({ 0.0f, 1.0f, 1.0f}, 1.0f, 20, 10, Pixel{150, 220, 255, 70});                  // glass
+
+    // ----- hovering disc -----
+    addDisc({-1.0f, 3.8f, -2.5f}, 1.6f, 32, Pixel{240, 150, 30, 255});
+
+    // ----- thin pillar, glossy box, stacked glass panes -----
+    addBox({-8.0f, 2.5f, -2.0f}, {0.3f, 2.5f, 0.3f}, 0.0f, Pixel{200, 200, 200, 255});
+    curSpread = 0.5f;
+    addBox({6.4f, 1.2f, 6.0f}, {0.8f, 1.2f, 0.8f}, 0.4f, Pixel{210, 170, 60, 255}, 0.6f);   // glossy gold
+    curSpread = 0.0f;
+    addQuad({-7.0f, 0.0f, -3.0f}, {-3.0f, 0.0f, -3.0f}, {-3.0f, 2.5f, -3.0f}, {-7.0f, 2.5f, -3.0f}, Pixel{255, 200, 120, 110});
+    addQuad({-7.0f, 0.0f, -3.8f}, {-3.0f, 0.0f, -3.8f}, {-3.0f, 2.5f, -3.8f}, {-7.0f, 2.5f, -3.8f}, Pixel{255, 200, 120, 110});
+
+    // ----- axis gizmo -----
+    addBox({0.0f, 0.3f, -6.0f}, {0.3f, 0.3f, 0.3f}, 0.0f, Pixel{240, 240, 240, 255});  // origin
+    addBox({1.2f, 0.3f, -6.0f}, {0.3f, 0.3f, 0.3f}, 0.0f, Pixel{230, 40, 40, 255});    // +x
+    addBox({0.0f, 0.9f, -6.0f}, {0.3f, 0.3f, 0.3f}, 0.0f, Pixel{40, 200, 60, 255});    // +y
+    addBox({0.0f, 0.3f, -4.8f}, {0.3f, 0.3f, 0.3f}, 0.0f, Pixel{50, 80, 240, 255});    // +z
+
+    // ----- precision / robustness traps -----
+    addTri({-4.0f, 0.5f, -9.0f}, {4.0f, 0.5f, -9.0f}, {4.0f, 0.502f, -9.0f}, Pixel{255, 0, 255, 255}); // sliver
+    addTri({0.0f, 6.0f, 5.0f}, {1.0f, 6.0f, 5.0f}, {2.0f, 6.0f, 5.0f}, Pixel{255, 255, 255, 255});     // collinear (degenerate)
+    addTri({1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, Pixel{255, 255, 255, 255});     // single point
+
+    cout << "triangles: " << triCount << "\n";
+
+    BVHNode scene(tris, triCount);
+    scene.sceneNode = true;
+    if(BVH_TV) buildBVH(&scene);
+
+    // ----- lights: R, G, B overhead + one white raking light -----
+    const int lightcount = 4;
+    LightSource lights[lightcount] = {
+        {{-7.0f, 10.0f, -10.0f}, 2.0f, 0.0f, 0.0f, 1.0f},
+        {{ 7.0f, 10.0f, -10.0f}, 0.0f, 2.0f, 0.0f, 1.0f},
+        {{ 0.0f, 10.0f,  8.0f}, 0.0f, 0.0f, 2.0f, 1.0f},
+        {{-11.0f, 1.5f,  2.0f}, 0.8f, 0.8f, 0.8f, 1.0f}
+    };
+
+    // ----- the 4 cameras -----
+    const CamJob jobs[4] = {
+        // file             position               focal  yaw     pitch   AA  tone                  reflDepth reflSamples
+        {"cam1_front.bmp",  {0.0f, 4.5f, -13.0f},  2.2f,  0.0f,   0.20f,  1,  ToneMapping::Reinhard, 3, 1},
+        {"cam2_top.bmp",    {0.0f, 26.0f, -1.0f},  3.0f,  0.0f,   1.5708f, 2, ToneMapping::Reinhard, 3, 1},
+        {"cam3_lowwide.bmp",{-12.0f, 1.3f, -12.0f},1.0f,  0.7854f,0.0f,   1,  ToneMapping::Clamp,    5, 1},
+        {"cam4_tele.bmp",   {0.5f, 2.5f, -12.0f},  4.0f,  0.255f, 0.065f, 1,  ToneMapping::Reinhard, 3, 2}
+    };
+
+    for(const CamJob &job : jobs){
+        auto t0 = std::chrono::steady_clock::now();
+        Frame frame(W, H, false);
+        Perspective cam(job.pos, &frame, job.focal);
+        if(job.yaw   != 0.0f) cam.jRotation(job.yaw);
+        if(job.pitch != 0.0f) cam.iRotation(job.pitch);
+        cam.reOrthonormalization();
+        cam.antialiasing = job.antialiasing;
+        cam.mode = job.mode;
+        cam.transparencyMaxDepth = 4;
+        cam.reflectionMaxDepth = job.reflectionDepth;
+        cam.reflectionSamplesPerAxis = job.reflectionSamples;
+        cam.reflectionSamplesReduction = 1;
+
+        cam.render(&scene, lights, lightcount);
+        bmpPrint(&frame, job.file);
+
+        auto t1 = std::chrono::steady_clock::now();
+        cout << job.file << " done in " << std::chrono::duration<double>(t1 - t0).count() << " s\n";
+    }
+
+    return 0;
+}
